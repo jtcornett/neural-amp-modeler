@@ -229,7 +229,8 @@ class _TCalibrateDelay(object):
 
 
 class TestCalibrateDelayV1(_TCalibrateDelay):
-    _calibrate_delay = staticmethod(core._calibrate_latency_v1)
+    # functools.partial is a method descriptor in Python 3.14.
+    _calibrate_delay = staticmethod(staticmethod(core._calibrate_latency_v1))
     _data_info = core._V1_DATA_INFO
 
 
