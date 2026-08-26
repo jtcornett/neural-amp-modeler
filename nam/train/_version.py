@@ -17,12 +17,16 @@ class Version:
 
     @classmethod
     def from_string(cls, s: str):
+        import re
+
         parts = s.split(".")
-        try:
-            major, minor, patch = [int(x) for x in parts[:3]]
-        except ValueError as e:
-            raise ValueError(f"Failed to parse version from string '{s}':\n{e}")
-        return cls(major=major, minor=minor, patch=patch)
+        nums = []
+        for p in parts[:3]:
+            match = re.search(r"\d+", p)
+            nums.append(int(match.group()) if match else 0)
+        while len(nums) < 3:
+            nums.append(0)
+        return cls(major=nums[0], minor=nums[1], patch=nums[2])
 
     def __eq__(self, other) -> bool:
         return (

@@ -12,6 +12,7 @@ readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
+    "customtkinter",
     "librosa",
     "matplotlib",
     "numpy",

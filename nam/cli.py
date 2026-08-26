@@ -6,6 +6,9 @@
 Command line interface entry points (GUI trainer, full trainer)
 """
 
+import matplotlib
+matplotlib.use("Agg", force=True)
+
 
 # This must happen first
 def _ensure_graceful_shutdowns():
@@ -23,6 +26,18 @@ def _ensure_graceful_shutdowns():
 
 
 _ensure_graceful_shutdowns()
+
+
+def _setup_apple_silicon_env():
+    import os
+    import sys
+
+    if sys.platform == "darwin":
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+_setup_apple_silicon_env()
 
 
 # This must happen ASAP but not before the graceful shutdown hack

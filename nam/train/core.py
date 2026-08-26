@@ -16,6 +16,7 @@ from copy import deepcopy as _deepcopy
 from functools import partial as _partial
 from pathlib import Path as _Path
 from time import time as _time
+from typing import Callable as _Callable
 from typing import Dict as _Dict
 from typing import NamedTuple as _NamedTuple
 from typing import Optional as _Optional
@@ -23,10 +24,34 @@ from typing import Sequence as _Sequence
 from typing import Tuple as _Tuple
 from typing import Union as _Union
 
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as _plt
+
+
+def _safe_plt_show():
+    if _plt.get_backend().lower() == "agg":
+        _plt.close("all")
+    else:
+        try:
+            _plt.show()
+        except Exception:
+            _plt.close("all")
+
 import numpy as _np
 import pytorch_lightning as _pl
 import torch as _torch
+
+import os as _os
+import sys as _sys
+
+# Apple Silicon MPS Optimizations
+if _sys.platform == "darwin":
+    _os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+    _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    if _torch.get_num_threads() > 10:
+        _torch.set_num_threads(10)
+
 from pydantic import BaseModel as _BaseModel
 from pytorch_lightning.utilities.warnings import (
     PossibleUserWarning as _PossibleUserWarning,
@@ -468,7 +493,7 @@ def _calibrate_latency_v_all(
             _plt.ylabel("Response")
             _plt.legend()
             _plt.title("SHARE THIS PLOT IF YOU ASK FOR HELP")
-            _plt.show()
+            _safe_plt_show()
         delays = []
         recommended = None
 
@@ -525,7 +550,7 @@ def _plot_latency_v_all(
         for ax, curve in zip(axs, (x, y)):
             ax.plot(t, curve)
             [ax.axvline(x=es, color="C1", linestyle="--") for es in expected_spikes]
-        _plt.show()
+        _safe_plt_show()
         if _nofail:
             raise RuntimeError("Failed to plot delay")
     else:
@@ -543,7 +568,7 @@ def _plot_latency_v_all(
             )
         _plt.axvline(x=0, linestyle="--", color="k")
         _plt.legend()
-        _plt.show()  # This doesn't freeze the notebook
+        _safe_plt_show()  # This doesn't freeze the notebook
 
 
 _plot_latency_v1 = _partial(_plot_latency_v_all, _V1_DATA_INFO)
@@ -685,7 +710,7 @@ def _check_v2(
                 _plt.grid()
             print(msg)
             if show_plot:
-                _plt.show()
+                _safe_plt_show()
             print(
                 "This is known to be a very sensitive test, so training will continue. "
                 "If the model doesn't look good, then this may be why!"
@@ -749,7 +774,7 @@ def _check_v3(
                 _plt.xlabel("Time (sec)")
                 _plt.legend()
                 _plt.title("V3 check: Validation replicate FAILURE")
-                _plt.show()
+                _safe_plt_show()
             return _metadata.DataChecks(version=3, passed=False)
     return _metadata.DataChecks(version=3, passed=True)
 
@@ -894,7 +919,6 @@ def _get_lightning_module_cls(model_config: _Dict):
         if model_config["net"]["name"] == "PackedWaveNet"
         else _LightningModule
     )
-
 
 def _get_configs(
     input_version: _Version,
@@ -1055,7 +1079,7 @@ def _plot(
         if filepath is not None:
             _plt.savefig(filepath + ".png")
         if not silent:
-            _plt.show()
+            _safe_plt_show()
         return validation_esr
 
     output = output.flatten()
@@ -1071,7 +1095,7 @@ def _plot(
     if filepath is not None:
         _plt.savefig(filepath + ".png")
     if not silent:
-        _plt.show()
+        _safe_plt_show()
     return esr
 
 
@@ -1195,14 +1219,106 @@ class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
             nam_path.unlink()
 
 
+class _NamProgressBarCallback(_pl.Callback):
+    def __init__(
+        self,
+        progress_callback: _Optional[
+            _Callable[[int, int, float, float, float], None]
+        ] = None,
+    ):
+        super().__init__()
+        self.progress_callback = progress_callback
+        self._epoch_start_time = None
+        self._batch_count = 0
+
+    def on_train_epoch_start(
+        self, trainer: _pl.Trainer, pl_module: _pl.LightningModule
+    ):
+        self._epoch_start_time = _time()
+        self._batch_count = 0
+
+    def on_train_batch_end(
+        self, trainer: _pl.Trainer, pl_module: _pl.LightningModule, outputs, batch, batch_idx
+    ):
+        self._batch_count += 1
+
+    def on_train_epoch_end(
+        self, trainer: _pl.Trainer, pl_module: _pl.LightningModule
+    ):
+        epoch = trainer.current_epoch + 1
+        max_epochs = trainer.max_epochs
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get("train_loss")
+        val_loss = metrics.get("val_loss")
+        esr = metrics.get("ESR")
+
+        now = _time()
+        epoch_dur = (now - self._epoch_start_time) if self._epoch_start_time else 0.0
+        it_per_sec = (
+            (self._batch_count / epoch_dur)
+            if (epoch_dur > 0 and self._batch_count > 0)
+            else 0.0
+        )
+
+        pct = int((epoch / max_epochs) * 100) if max_epochs > 0 else 0
+        bar_len = 15
+        filled = int(bar_len * epoch / max_epochs) if max_epochs > 0 else 0
+        bar_str = "[" + "=" * filled + " " * (bar_len - filled) + "]"
+
+        v_esr_val = float(esr.item() if hasattr(esr, "item") else esr) if esr is not None else 0.0
+
+        parts = [f"Epoch {epoch:3d}/{max_epochs} {bar_str} {pct:3d}%"]
+        if epoch_dur > 0:
+            parts.append(f"{epoch_dur:.2f}s/epoch ({it_per_sec:.2f} it/s)")
+        if val_loss is not None:
+            v_val = val_loss.item() if hasattr(val_loss, "item") else val_loss
+            parts.append(f"val_loss: {v_val:.6f}")
+        if esr is not None:
+            parts.append(f"ESR: {v_esr_val:.6f}")
+        elif train_loss is not None:
+            v_tl = train_loss.item() if hasattr(train_loss, "item") else train_loss
+            parts.append(f"loss: {v_tl:.6f}")
+
+        print(" | ".join(parts), flush=True)
+
+        if self.progress_callback:
+            try:
+                self.progress_callback(
+                    epoch, max_epochs, epoch_dur, it_per_sec, v_esr_val
+                )
+            except Exception:
+                pass
+
+
+class _CancellationCallback(_pl.Callback):
+    def __init__(self, is_canceled_fn: _Callable[[], bool]):
+        super().__init__()
+        self.is_canceled_fn = is_canceled_fn
+
+    def on_train_batch_end(
+        self, trainer: _pl.Trainer, pl_module: _pl.LightningModule, outputs, batch, batch_idx
+    ):
+        if self.is_canceled_fn():
+            trainer.should_stop = True
+
+    def on_train_epoch_end(self, trainer: _pl.Trainer, pl_module: _pl.LightningModule):
+        if self.is_canceled_fn():
+            trainer.should_stop = True
+
+
 def get_callbacks(
     threshold_esr: _Optional[float],
     packed: bool = False,
     user_metadata: _Optional[_UserMetadata] = None,
     settings_metadata: _Optional[_metadata.Settings] = None,
     data_metadata: _Optional[_metadata.Data] = None,
+    is_canceled_fn: _Optional[_Callable[[], bool]] = None,
+    progress_callback: _Optional[
+        _Callable[[int, int, float, float, float], None]
+    ] = None,
 ):
     callbacks = [
+        _NamProgressBarCallback(progress_callback=progress_callback),
         _ModelCheckpoint(
             filename="checkpoint_best_{epoch:04d}_{step}_{ESR:.4g}_{MSE:.3e}",
             save_top_k=3,
@@ -1226,6 +1342,8 @@ def get_callbacks(
         callbacks.append(
             _ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
         )
+    if is_canceled_fn is not None:
+        callbacks.append(_CancellationCallback(is_canceled_fn))
     return callbacks
 
 
@@ -1333,6 +1451,10 @@ def train(
     threshold_esr: _Optional[float] = None,
     user_metadata: _Optional[_UserMetadata] = None,
     fast_dev_run: _Union[bool, int] = False,
+    is_canceled_fn: _Optional[_Callable[[], bool]] = None,
+    progress_callback: _Optional[
+        _Callable[[int, int, float, float, float], None]
+    ] = None,
 ) -> _Optional[TrainOutput]:
     """
     :param input_path: Full path to input file
@@ -1445,6 +1567,8 @@ def train(
         user_metadata=user_metadata,
         settings_metadata=settings_metadata,
         data_metadata=data_metadata,
+        is_canceled_fn=is_canceled_fn,
+        progress_callback=progress_callback,
     )
     packed_best_callback = next(
         (c for c in callbacks if isinstance(c, _PackedBestCheckpoint)),
@@ -1510,14 +1634,15 @@ def train(
         for dl in (train_dataloader, val_dataloader):
             assert isinstance(dl.dataset, _AbstractDataset)
             dl.dataset.teardown()
-        return TrainOutput(
-            model=model,
-            metadata=_metadata.TrainingMetadata(
-                settings=settings_metadata,
-                data=data_metadata,
-                validation_esr=validation_esr,
-            ),
-        )
+
+    return TrainOutput(
+        model=model,
+        metadata=_metadata.TrainingMetadata(
+            settings=settings_metadata,
+            data=data_metadata,
+            validation_esr=validation_esr,
+        ),
+    )
 
 
 class DataInputValidation(_BaseModel):

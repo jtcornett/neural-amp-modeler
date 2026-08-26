@@ -1,1348 +1,785 @@
 # File: gui.py
 # Created Date: Saturday February 25th 2023
 # Author: Steven Atkinson (steven@atkinson.mn)
+# Modernized: Neural Amp Modeler Team
 
 """
-GUI for training
+GUI for training Neural Amp Modeler models with modern CustomTkinter interface,
+non-blocking multi-threaded task queue (max 3 concurrent jobs), and per-job live log viewports.
 
 Usage:
 >>> from nam.train.gui import run
 >>> run()
 """
 
-import abc as _abc
-import re as _re
-import sys as _sys
-import tkinter as _tk
-import webbrowser as _webbrowser
-from dataclasses import dataclass as _dataclass
-from enum import Enum as _Enum
-from functools import partial as _partial
+import os
+import re
+import sys
+import tkinter as tk
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import requests as _requests
+import matplotlib
+matplotlib.use("Agg", force=True)
+import requests
 
-try:  # Not supported in Colab
-    from idlelib.tooltip import Hovertip
-except ModuleNotFoundError:
-    # Hovertips won't work
-    class Hovertip(object):
-        """
-        Shell class
-        """
+try:
+    import customtkinter as ctk
 
-        def __init__(self, *args, **kwargs):
-            pass
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    _HAVE_CUSTOMTKINTER = True
+except ImportError:
+    _HAVE_CUSTOMTKINTER = False
 
-
-from pathlib import Path as _Path
-from tkinter import filedialog as _filedialog
-from typing import Any as _Any
-from typing import Callable as _Callable
-from typing import Dict as _Dict
-from typing import NamedTuple as _NamedTuple
-from typing import Optional as _Optional
-from typing import Sequence as _Sequence
-
-try:  # 3rd-party and 1st-party imports
-    import torch as _torch
+try:
+    import torch
 
     from nam import __version__
-    from nam.data import Split as _Split
-    from nam.models.metadata import GearType as _GearType
-    from nam.models.metadata import ToneType as _ToneType
-    from nam.models.metadata import UserMetadata as _UserMetadata
-
-    # Ok private access here--this is technically allowed access
+    from nam.data import Split
+    from nam.models.metadata import GearType, ToneType, UserMetadata
     from nam.train import core as _core
     from nam.train import metadata as _metadata
-    from nam.train._names import INPUT_BASENAMES as _INPUT_BASENAMES
-    from nam.train._names import LATEST_VERSION as _LATEST_VERSION
-    from nam.train._version import Version as _Version
-    from nam.train._version import get_current_version as _get_current_version
-    from nam.train.gui._resources import settings as _settings
+    from nam.train._version import get_current_version
+    _get_current_version = get_current_version
+    from nam.train.gui._resources import settings
+    from nam.train.gui.task_manager import TaskManager, TaskStatus, TrainingTask
 
-    _install_is_valid = True
-    _HAVE_ACCELERATOR = _torch.cuda.is_available() or _torch.backends.mps.is_available()
+    _INSTALL_IS_VALID = True
+    _HAVE_ACCELERATOR = torch.cuda.is_available() or torch.backends.mps.is_available()
 except ImportError:
-    _install_is_valid = False
+    _INSTALL_IS_VALID = False
     _HAVE_ACCELERATOR = False
 
 if _HAVE_ACCELERATOR:
     _DEFAULT_NUM_EPOCHS = 100
-    _DEFAULT_BATCH_SIZE = 16
 else:
     _DEFAULT_NUM_EPOCHS = 20
-    _DEFAULT_BATCH_SIZE = 1
-_BUTTON_WIDTH = 20
-_BUTTON_HEIGHT = 2
-_TEXT_WIDTH = 70
-
-_DEFAULT_DELAY = None
-_DEFAULT_IGNORE_CHECKS = False
-_DEFAULT_THRESHOLD_ESR = None
-
-_ADVANCED_OPTIONS_LEFT_WIDTH = 12
-_ADVANCED_OPTIONS_RIGHT_WIDTH = 12
-_METADATA_LEFT_WIDTH = 19
-_METADATA_RIGHT_WIDTH = 60
 
 
 def _is_mac() -> bool:
-    return _sys.platform == "darwin"
+    return sys.platform == "darwin"
 
 
-_SYSTEM_TEXT_COLOR = "systemTextColor" if _is_mac() else "black"
-
-
-def _get_latest_version_from_github() -> _Optional[_Version]:
-    """
-    Fetch releases from GitHub and return the newest version, or None on error.
-    """
+def _get_latest_version_from_github() -> Optional[str]:
     url = "https://api.github.com/repos/sdatkinson/neural-amp-modeler/releases"
     try:
-        response = _requests.get(url)
-    except _requests.exceptions.ConnectionError:
-        print("WARNING: Failed to reach the server to check for updates")
-        return None
-    if response.status_code != 200:
-        print(f"Failed to fetch releases. Status code: {response.status_code}")
-        return None
-    releases = response.json()
-    latest_version = None
-    if releases:
-        for release in releases:
-            tag = release["tag_name"]
-            if not tag.startswith("v"):
-                print(f"Found invalid version {tag}")
-            else:
-                this_version = _Version.from_string(tag[1:])
-                if latest_version is None or this_version > latest_version:
-                    latest_version = this_version
-    else:
-        print("No releases found for this repository.")
-    return latest_version
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            releases = response.json()
+            if releases and len(releases) > 0:
+                tag = releases[0].get("tag_name", "")
+                return tag.lstrip("v")
+    except Exception:
+        pass
+    return None
 
 
-@_dataclass
-class AdvancedOptions(object):
+class JobTabUI:
     """
-    :param num_epochs: How many epochs to train for.
-    :param latency: Latency between the input and output audio, in samples.
-        None means we don't know and it has to be calibrated.
-    :param ignore_checks: Keep going even if a check says that something is wrong.
-    :param threshold_esr: Stop training if the ESR gets better than this. If None, don't
-        stop.
+    Represents a dynamic tab in the UI for a single training job.
     """
 
-    num_epochs: int
-    latency: _Optional[int]
-    ignore_checks: bool
-    threshold_esr: _Optional[float]
+    def __init__(self, tabview: ctk.CTkTabview, task: TrainingTask, task_manager: TaskManager, on_close_tab_cb: Callable[[str], None]):
+        self.tabview = tabview
+        self.task = task
+        self.task_manager = task_manager
+        self.on_close_tab_cb = on_close_tab_cb
+        self.tab_name = f"#{task.task_id}: {task.name[:16]}"
 
+        self.tabview.add(self.tab_name)
+        self.frame = self.tabview.tab(self.tab_name)
 
-class _PathType(_Enum):
-    FILE = "file"
-    DIRECTORY = "directory"
-    MULTIFILE = "multifile"
+        self._build_ui()
+        self.update_status()
 
+    def _build_ui(self):
+        # Header status card
+        self.header_frame = ctk.CTkFrame(self.frame, corner_radius=10)
+        self.header_frame.pack(fill="x", padx=10, pady=10)
 
-class _PathButton(object):
-    """
-    Button and the path
-    """
+        # Title & audio file details
+        info_frame = ctk.CTkFrame(self.header_frame, fg_color="transparent")
+        info_frame.pack(side="left", fill="both", expand=True, padx=15, pady=10)
 
-    def __init__(
-        self,
-        frame: _tk.Frame,
-        button_text: str,
-        info_str: str,
-        path_type: _PathType,
-        path_key: _settings.PathKey,
-        hooks: _Optional[_Sequence[_Callable[[], None]]] = None,
-        color_when_not_set: str = "#EF0000",  # Darker red
-        color_when_set: str = _SYSTEM_TEXT_COLOR,
-        default: _Optional[_Path] = None,
-    ):
-        """
-        :param hooks: Callables run at the end of setting the value.
-        """
-        self._button_text = button_text
-        self._info_str = info_str
-        self._path: _Optional[_Path] = default
-        self._path_type = path_type
-        self._path_key = path_key
-        self._frame = frame
-        self._widgets = {}
-        self._widgets["button"] = _tk.Button(
-            self._frame,
-            text=button_text,
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._set_val,
-        )
-        self._widgets["button"].pack(side=_tk.LEFT)
-        self._widgets["label"] = _tk.Label(
-            self._frame,
-            width=_TEXT_WIDTH,
-            height=_BUTTON_HEIGHT,
-            bg=None,
+        self.title_label = ctk.CTkLabel(
+            info_frame,
+            text=f"Task #{self.task.task_id}: {self.task.name}",
+            font=ctk.CTkFont(size=16, weight="bold"),
             anchor="w",
         )
-        self._widgets["label"].pack(side=_tk.LEFT)
-        self._hooks = hooks
-        self._color_when_not_set = color_when_not_set
-        self._color_when_set = color_when_set
-        self._set_text()
+        self.title_label.pack(anchor="w")
 
-    def __setitem__(self, key, val):
-        """
-        Implement tk-style setter for state
-        """
-        if key == "state":
-            for widget in self._widgets.values():
-                widget["state"] = val
+        self.detail_label = ctk.CTkLabel(
+            info_frame,
+            text=f"Output File: {self.task.output_path.name}  |  Epochs: {self.task.epochs}",
+            font=ctk.CTkFont(size=12),
+            text_color="gray70",
+            anchor="w",
+        )
+        self.detail_label.pack(anchor="w")
+
+        self.metrics_label = ctk.CTkLabel(
+            info_frame,
+            text="",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#00E676",
+            anchor="w",
+        )
+        self.metrics_label.pack(anchor="w", pady=(2, 0))
+
+        # Status badge & controls
+        control_frame = ctk.CTkFrame(self.header_frame, fg_color="transparent")
+        control_frame.pack(side="right", padx=15, pady=10)
+
+        self.status_badge = ctk.CTkLabel(
+            control_frame,
+            text=self.task.status.value.upper(),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=6,
+            fg_color=self._get_status_color(self.task.status),
+            text_color="white",
+            padx=12,
+            pady=4,
+        )
+        self.status_badge.pack(side="top", pady=5)
+
+        button_subframe = ctk.CTkFrame(control_frame, fg_color="transparent")
+        button_subframe.pack(side="top", pady=5)
+
+        self.cancel_button = ctk.CTkButton(
+            button_subframe,
+            text="Cancel Job",
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            width=90,
+            height=28,
+            command=self._cancel_job,
+        )
+        self.cancel_button.pack(side="left", padx=3)
+
+        self.open_dir_button = ctk.CTkButton(
+            button_subframe,
+            text="Open Folder",
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            width=90,
+            height=28,
+            command=self._open_export_dir,
+            state="disabled",
+        )
+        self.open_dir_button.pack(side="left", padx=3)
+
+        self.close_tab_button = ctk.CTkButton(
+            button_subframe,
+            text="Close Tab",
+            fg_color="gray40",
+            hover_color="gray30",
+            width=80,
+            height=28,
+            command=self._close_tab,
+            state="disabled",
+        )
+        self.close_tab_button.pack(side="left", padx=3)
+
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(self.frame, height=8, corner_radius=4)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 10))
+        self.progress_bar.set(0)
+
+        # Console Log Viewport Card
+        log_frame = ctk.CTkFrame(self.frame, corner_radius=10)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        log_title = ctk.CTkLabel(
+            log_frame,
+            text="Commandline Output Viewport",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        )
+        log_title.pack(anchor="w", padx=12, pady=(10, 5))
+
+        self.log_textbox = ctk.CTkTextbox(
+            log_frame,
+            font=ctk.CTkFont(family="Consolas" if os.name == "nt" else "Menlo", size=11),
+            fg_color="#0D0D0D",
+            text_color="#00FF66",
+            wrap="word",
+            corner_radius=6,
+        )
+        self.log_textbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _get_status_color(self, status: TaskStatus) -> str:
+        if status == TaskStatus.QUEUED:
+            return "#F57C00"  # Amber
+        elif status == TaskStatus.RUNNING:
+            return "#0288D1"  # Cyan/Blue
+        elif status == TaskStatus.COMPLETED:
+            return "#2E7D32"  # Green
+        elif status == TaskStatus.FAILED:
+            return "#C62828"  # Red
         else:
-            raise RuntimeError(
-                f"{self.__class__.__name__} instance does not support item assignment for non-state key {key}!"
-            )
+            return "#616161"  # Grey
 
-    @property
-    def val(self) -> _Optional[_Path]:
-        return self._path
-
-    def _set_text(self):
-        if self._path is None:
-            self._widgets["label"]["fg"] = self._color_when_not_set
-            self._widgets["label"]["text"] = self._info_str
-        else:
-            val = self.val
-            val = val[0] if isinstance(val, tuple) and len(val) == 1 else val
-            self._widgets["label"]["fg"] = self._color_when_set
-            self._widgets["label"][
-                "text"
-            ] = f"{self._button_text.capitalize()} set to {val}"
-
-    def _set_val(self):
-        last_path = _settings.get_last_path(self._path_key)
-        if last_path is None:
-            initial_dir = None
-        elif not last_path.is_dir():
-            initial_dir = last_path.parent
-        else:
-            initial_dir = last_path
-        result = {
-            _PathType.FILE: _filedialog.askopenfilename,
-            _PathType.DIRECTORY: _filedialog.askdirectory,
-            _PathType.MULTIFILE: _filedialog.askopenfilenames,
-        }[self._path_type](initialdir=str(initial_dir))
-        if result != "":
-            self._path = result
-            _settings.set_last_path(
-                self._path_key,
-                _Path(result[0] if self._path_type == _PathType.MULTIFILE else result),
-            )
-        self._set_text()
-
-        if self._hooks is not None:
-            for h in self._hooks:
-                h()
-
-
-class _InputPathButton(_PathButton):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Download the training file!
-        self._widgets["button_download_input"] = _tk.Button(
-            self._frame,
-            text="Download input file",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._download_input_file,
+    def update_status(self):
+        status = self.task.status
+        self.status_badge.configure(
+            text=status.value.upper(),
+            fg_color=self._get_status_color(status),
         )
-        self._widgets["button_download_input"].pack(side=_tk.RIGHT)
-
-    @classmethod
-    def _download_input_file(cls):
-        file_urls = {
-            "input.wav": "https://drive.google.com/file/d/1KbaS4oXXNEuh2aCPLwKrPdf5KFOjda8G/view?usp=drive_link",
-            "v3_0_0.wav": "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view?usp=drive_link",
-            "v2_0_0.wav": "https://drive.google.com/file/d/1xnyJP_IZ7NuyDSTJfn-Jmc5lw0IE7nfu/view?usp=drive_link",
-            "v1_1_1.wav": "",
-            "v1.wav": "",
-        }
-        # Pick the most recent file.
-        for input_basename in _INPUT_BASENAMES:
-            name = input_basename.name
-            url = file_urls.get(name)
-            if url:
-                if name != _LATEST_VERSION.name:
-                    print(
-                        f"WARNING: File {name} is out of date. "
-                        "This needs to be updated!"
-                    )
-                _webbrowser.open(url)
-                return
-
-
-class _CheckboxKeys(_Enum):
-    """
-    Keys for checkboxes
-    """
-
-    SILENT_TRAINING = "silent_training"
-    SAVE_PLOT = "save_plot"
-
-
-class _TopLevelWithOk(_tk.Toplevel):
-    """
-    Toplevel with an Ok button (provide yourself!)
-    """
-
-    def __init__(
-        self, on_ok: _Callable[[None], None], resume_main: _Callable[[None], None]
-    ):
-        """
-        :param on_ok: What to do when "Ok" button is pressed
-        """
-        super().__init__()
-        self._on_ok = on_ok
-        self._resume_main = resume_main
-
-    def destroy(self, pressed_ok: bool = False):
-        if pressed_ok:
-            self._on_ok()
-        self._resume_main()
-        super().destroy()
-
-
-class _TopLevelWithYesNo(_tk.Toplevel):
-    """
-    Toplevel holding functions for yes/no buttons to close
-    """
-
-    def __init__(
-        self,
-        on_yes: _Callable[[None], None],
-        on_no: _Callable[[None], None],
-        on_close: _Optional[_Callable[[None], None]],
-        resume_main: _Callable[[None], None],
-    ):
-        """
-        :param on_yes: What to do when "Yes" button is pressed.
-        :param on_no: What to do when "No" button is pressed.
-        :param on_close: Do this regardless when closing (via yes/no/x) before
-            resuming.
-        """
-        super().__init__()
-        self._on_yes = on_yes
-        self._on_no = on_no
-        self._on_close = on_close
-        self._resume_main = resume_main
-
-    def destroy(self, pressed_yes: bool = False, pressed_no: bool = False):
-        if pressed_yes:
-            self._on_yes()
-        if pressed_no:
-            self._on_no()
-        if self._on_close is not None:
-            self._on_close()
-        self._resume_main()
-        super().destroy()
-
-
-class _OkModal(object):
-    """
-    Message and OK button
-    """
-
-    def __init__(self, resume_main, msg: str, label_kwargs: _Optional[dict] = None):
-        label_kwargs = {} if label_kwargs is None else label_kwargs
-
-        self._root = _TopLevelWithOk((lambda: None), resume_main)
-        self._text = _tk.Label(self._root, text=msg, **label_kwargs)
-        self._text.pack()
-        self._ok = _tk.Button(
-            self._root,
-            text="Ok",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=lambda: self._root.destroy(pressed_ok=True),
-        )
-        self._ok.pack()
-
-
-class _YesNoModal(object):
-    """
-    Modal w/ yes/no buttons
-    """
-
-    def __init__(
-        self,
-        on_yes: _Callable[[None], None],
-        on_no: _Callable[[None], None],
-        resume_main,
-        msg: str,
-        on_close: _Optional[_Callable[[None], None]] = None,
-        label_kwargs: _Optional[dict] = None,
-    ):
-        label_kwargs = {} if label_kwargs is None else label_kwargs
-        self._root = _TopLevelWithYesNo(on_yes, on_no, on_close, resume_main)
-        self._text = _tk.Label(self._root, text=msg, **label_kwargs)
-        self._text.pack()
-        self._buttons_frame = _tk.Frame(self._root)
-        self._buttons_frame.pack()
-        self._yes = _tk.Button(
-            self._buttons_frame,
-            text="Yes",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=lambda: self._root.destroy(pressed_yes=True),
-        )
-        self._yes.pack(side=_tk.LEFT)
-        self._no = _tk.Button(
-            self._buttons_frame,
-            text="No",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=lambda: self._root.destroy(pressed_no=True),
-        )
-        self._no.pack(side=_tk.RIGHT)
-
-
-class _UpdateAvailableModal(object):
-    """
-    Modal shown when a new version is available. Message, "Do not show this again"
-    checkbox, and Close button. Does not offer an in-GUI upgrade; instructs user to
-    run pip install --upgrade.
-    """
-
-    def __init__(self, resume_main: _Callable[[], None], version: str):
-        self._root = _tk.Toplevel()
-        self._root.title("Update available")
-        msg = (
-            f"neural-amp-modeler v{version} is now available. To upgrade, run "
-            "pip install --upgrade neural-amp-modeler in your terminal."
-        )
-        self._label = _tk.Label(
-            self._root,
-            text=msg,
-            justify=_tk.LEFT,
-            wraplength=400,
-        )
-        self._label.pack(padx=10, pady=10)
-        self._never_show_var = _tk.BooleanVar(value=False)
-        self._checkbox = _tk.Checkbutton(
-            self._root,
-            text="Do not show this again",
-            variable=self._never_show_var,
-        )
-        self._checkbox.pack(anchor="w", padx=10, pady=5)
-        self._close_btn = _tk.Button(
-            self._root,
-            text="Close",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._on_close,
-        )
-        self._close_btn.pack(pady=10)
-        self._resume_main = resume_main
-
-    def _on_close(self):
-        if self._never_show_var.get():
-            _settings.set_update_settings(never_show_again=True)
-        self._resume_main()
-        self._root.destroy()
-
-
-class _GUIWidgets(_Enum):
-    INPUT_PATH = "input_path"
-    OUTPUT_PATH = "output_path"
-    TRAINING_DESTINATION = "training_destination"
-    METADATA = "metadata"
-    ADVANCED_OPTIONS = "advanced_options"
-    TRAIN = "train"
-
-
-@_dataclass
-class Checkbox(object):
-    variable: _tk.BooleanVar
-    check_button: _tk.Checkbutton
-
-
-class GUI(object):
-    def __init__(self):
-        self._root = _tk.Tk()
-        self._root.title(f"NAM Trainer - v{__version__}")
-        self._widgets = {}
-
-        # Buttons for paths:
-        self._frame_input = _tk.Frame(self._root)
-        self._frame_input.pack(anchor="w")
-        self._widgets[_GUIWidgets.INPUT_PATH] = _InputPathButton(
-            self._frame_input,
-            "Input Audio",
-            f"Select input (DI) file (e.g. {_LATEST_VERSION.name})",
-            _PathType.FILE,
-            _settings.PathKey.INPUT_FILE,
-            hooks=[self._check_button_states],
-        )
-
-        self._frame_output_path = _tk.Frame(self._root)
-        self._frame_output_path.pack(anchor="w")
-        self._widgets[_GUIWidgets.OUTPUT_PATH] = _PathButton(
-            self._frame_output_path,
-            "Output Audio",
-            "Select output (reamped) file - (Choose MULTIPLE FILES to enable BATCH TRAINING)",
-            _PathType.MULTIFILE,
-            _settings.PathKey.OUTPUT_FILE,
-            hooks=[self._check_button_states],
-        )
-
-        self._frame_train_destination = _tk.Frame(self._root)
-        self._frame_train_destination.pack(anchor="w")
-        self._widgets[_GUIWidgets.TRAINING_DESTINATION] = _PathButton(
-            self._frame_train_destination,
-            "Train Destination",
-            "Select training output directory",
-            _PathType.DIRECTORY,
-            _settings.PathKey.TRAINING_DESTINATION,
-            hooks=[self._check_button_states],
-        )
-
-        # Metadata
-        self.user_metadata = _UserMetadata()
-        self._frame_metadata = _tk.Frame(self._root)
-        self._frame_metadata.pack(anchor="w")
-        self._widgets["metadata"] = _tk.Button(
-            self._frame_metadata,
-            text="Metadata...",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._open_metadata,
-        )
-        self._widgets["metadata"].pack()
-        self.user_metadata_flag = False
-
-        # This should probably be to the right somewhere
-        self._get_additional_options_frame()
-
-        # Last frames: advanced options & train in the SE corner:
-        self._frame_advanced_options = _tk.Frame(self._root)
-        self._frame_train = _tk.Frame(self._root)
-        # Pack must be in reverse order
-        self._frame_train.pack(side=_tk.BOTTOM, anchor="e")
-        self._frame_advanced_options.pack(side=_tk.BOTTOM, anchor="e")
-
-        # Advanced options for training
-        self.advanced_options = AdvancedOptions(
-            num_epochs=_DEFAULT_NUM_EPOCHS,
-            latency=_DEFAULT_DELAY,
-            ignore_checks=_DEFAULT_IGNORE_CHECKS,
-            threshold_esr=_DEFAULT_THRESHOLD_ESR,
-        )
-        # Window to edit them:
-
-        self._widgets[_GUIWidgets.ADVANCED_OPTIONS] = _tk.Button(
-            self._frame_advanced_options,
-            text="Advanced options...",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._open_advanced_options,
-        )
-        self._widgets[_GUIWidgets.ADVANCED_OPTIONS].pack()
-
-        # Train button
-
-        self._widgets[_GUIWidgets.TRAIN] = _tk.Button(
-            self._frame_train,
-            text="Train",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=self._train,
-        )
-        self._widgets[_GUIWidgets.TRAIN].pack()
-
-        self._show_update_modal_if_update_available()
-
-        self._check_button_states()
-
-    def core_train_kwargs(self) -> _Dict[str, _Any]:
-        """
-        Get any additional kwargs to provide to `core.train`
-        """
-        return {
-            "batch_size": _DEFAULT_BATCH_SIZE,
-            "seed": 0,
-        }
-
-    def _check_button_states(self):
-        """
-        Determine if any buttons should be disabled
-        """
-        # Train button is disabled unless all paths are set
-        if any(
-            pb.val is None
-            for pb in (
-                self._widgets[_GUIWidgets.INPUT_PATH],
-                self._widgets[_GUIWidgets.OUTPUT_PATH],
-                self._widgets[_GUIWidgets.TRAINING_DESTINATION],
-            )
-        ):
-            self._widgets[_GUIWidgets.TRAIN]["state"] = _tk.DISABLED
-            return
-        self._widgets[_GUIWidgets.TRAIN]["state"] = _tk.NORMAL
-
-    def _get_additional_options_frame(self):
-        # Checkboxes
-        # TODO get these definitions into __init__()
-        self._frame_checkboxes = _tk.Frame(self._root)
-        self._frame_checkboxes.pack(side=_tk.LEFT)
-        row = 1
-
-        def make_checkbox(
-            key: _CheckboxKeys, text: str, default_value: bool
-        ) -> Checkbox:
-            variable = _tk.BooleanVar()
-            variable.set(default_value)
-            check_button = _tk.Checkbutton(
-                self._frame_checkboxes, text=text, variable=variable
-            )
-            self._checkboxes[key] = Checkbox(variable, check_button)
-            self._widgets[key] = check_button  # For tracking in set-all-widgets ops
-
-        self._checkboxes: _Dict[_CheckboxKeys, Checkbox] = dict()
-        make_checkbox(
-            _CheckboxKeys.SILENT_TRAINING,
-            "Silent run (suggested for batch training)",
-            False,
-        )
-        make_checkbox(_CheckboxKeys.SAVE_PLOT, "Save ESR plot automatically", True)
-
-        # Grid them:
-        row = 1
-        for v in self._checkboxes.values():
-            v.check_button.grid(row=row, column=1, sticky="W")
-            row += 1
-
-    def mainloop(self):
-        self._root.mainloop()
-
-    def _disable(self):
-        self._set_all_widget_states_to(_tk.DISABLED)
-
-    def _open_advanced_options(self):
-        """
-        Open window for advanced options
-        """
-
-        self._wait_while_func(lambda resume: AdvancedOptionsGUI(resume, self))
-
-    def _open_metadata(self):
-        """
-        Open window for metadata
-        """
-
-        self._wait_while_func(lambda resume: UserMetadataGUI(resume, self))
-
-    def _show_update_modal_if_update_available(self):
-        class UpdateInfo(_NamedTuple):
-            available: bool
-            current_version: _Version
-            new_version: _Optional[_Version]
-
-        def get_info() -> UpdateInfo:
-            current_version = _get_current_version()
-            latest_version = _get_latest_version_from_github()
-            update_available = (
-                latest_version is not None and latest_version > current_version
-            )
-            return UpdateInfo(
-                available=update_available,
-                current_version=current_version,
-                new_version=latest_version,
-            )
-
-        update_info = get_info()
-        if not update_info.available or update_info.new_version is None:  # No news
-            return
-        # Now figure out what we've seen in the past
-        update_settings = _settings.get_update_settings()
-
-        settings_version = (
-            _Version.from_string(update_settings["newest_available_version"])
-            if update_settings["newest_available_version"] is not None
-            else None
-        )
-        # Different new version since we last checked
-        if settings_version is None or update_info.new_version > settings_version:
-            _settings.set_update_settings(
-                newest_available_version=str(update_info.new_version),
-                never_show_again=False,
-            )
-            update_settings = _settings.get_update_settings()
-        if update_settings["never_show_again"]:
-            return
-        else:
-            self._wait_while_func(
-                lambda resume: _UpdateAvailableModal(
-                    resume, str(update_info.new_version)
-                ),
-            )
-
-    def _resume(self):
-        self._set_all_widget_states_to(_tk.NORMAL)
-        self._check_button_states()
-
-    def _set_all_widget_states_to(self, state):
-        for widget in self._widgets.values():
-            widget["state"] = state
-
-    def _train(self):
-        input_path = self._widgets[_GUIWidgets.INPUT_PATH].val
-        output_paths = self._widgets[_GUIWidgets.OUTPUT_PATH].val
-        # Validate all files before running:
-        success = self._validate_all_data(input_path, output_paths)
-        if success:
-            self._train2()
-
-    def _train2(self, ignore_checks=False):
-        input_path = self._widgets[_GUIWidgets.INPUT_PATH].val
-
-        # Advanced options:
-        num_epochs = self.advanced_options.num_epochs
-        user_latency = self.advanced_options.latency
-        file_list = self._widgets[_GUIWidgets.OUTPUT_PATH].val
-        threshold_esr = self.advanced_options.threshold_esr
-
-        # Run it
-        for file in file_list:
-            print(f"Now training {file}")
-            basename = _re.sub(r"\.wav$", "", file.split("/")[-1])
-            user_metadata = (
-                self.user_metadata if self.user_metadata_flag else _UserMetadata()
-            )
-
-            train_output = _core.train(
-                input_path,
-                file,
-                self._widgets[_GUIWidgets.TRAINING_DESTINATION].val,
-                epochs=num_epochs,
-                latency=user_latency,
-                silent=self._checkboxes[_CheckboxKeys.SILENT_TRAINING].variable.get(),
-                save_plot=self._checkboxes[_CheckboxKeys.SAVE_PLOT].variable.get(),
-                modelname=basename,
-                ignore_checks=ignore_checks,
-                local=True,
-                threshold_esr=threshold_esr,
-                user_metadata=user_metadata,
-                **self.core_train_kwargs(),
-            )
-
-            if train_output.model is None:
-                print("Model training failed! Skip exporting...")
-                continue
-            print("Model training complete!")
-            print("Exporting...")
-            outdir = self._widgets[_GUIWidgets.TRAINING_DESTINATION].val
-            print(f"Exporting trained model to {outdir}...")
-            train_output.model.net.export(
-                outdir,
-                basename=basename,
-                user_metadata=user_metadata,
-                other_metadata={
-                    _metadata.TRAINING_KEY: train_output.metadata.model_dump()
-                },
-            )
-            print("Done!")
-
-        # Metadata was only valid for 1 run (possibly a batch), so make sure it's not
-        # used again unless the user re-visits the window and clicks "ok".
-        self.user_metadata_flag = False
-
-    def _validate_all_data(
-        self, input_path: _Path, output_paths: _Sequence[_Path]
-    ) -> bool:
-        """
-        Validate all the data.
-        If something doesn't pass, then alert the user and ask them whether they
-        want to continue.
-
-        :return: whether we passed (NOTE: Training in spite of failure is
-            triggered by a modal that is produced on failure.)
-        """
-
-        def make_message_for_file(
-            output_path: str, validation_output: _core.DataValidationOutput
-        ) -> str:
-            """
-            State the file and explain what's wrong with it.
-            """
-            # TODO put this closer to what it looks at, i.e. core.DataValidationOutput
-            msg = (
-                f"\t{_Path(output_path).name}:\n"  # They all have the same directory so
-            )
-            if not validation_output.sample_rate.passed:
-                msg += (
-                    "\t\t There are different sample rates for the input ("
-                    f"{validation_output.sample_rate.input}) and output ("
-                    f"{validation_output.sample_rate.output}).\n"
-                )
-            if not validation_output.length.passed:
-                msg += (
-                    "\t\t* The input and output audio files are too different in length"
-                )
-                if validation_output.length.delta_seconds > 0:
-                    msg += (
-                        f" (the output is {validation_output.length.delta_seconds:.2f} "
-                        "seconds longer than the input)\n"
+        if status in (TaskStatus.RUNNING, TaskStatus.QUEUED):
+            self.cancel_button.configure(state="normal")
+            self.open_dir_button.configure(state="disabled")
+            self.close_tab_button.configure(state="disabled")
+            if status == TaskStatus.RUNNING:
+                self.progress_bar.stop()
+                self.progress_bar.configure(mode="determinate")
+                self.progress_bar.set(self.task.progress_ratio)
+                if self.task.current_epoch > 0:
+                    pct = int(self.task.progress_ratio * 100)
+                    self.metrics_label.configure(
+                        text=f"Progress: Epoch {self.task.current_epoch}/{self.task.total_epochs} ({pct}%)  |  Speed: {self.task.it_per_sec:.2f} it/s ({self.task.epoch_dur:.2f}s/ep)  |  ESR: {self.task.esr:.6f}"
                     )
                 else:
-                    msg += (
-                        f" (the output is {-validation_output.length.delta_seconds:.2f}"
-                        " seconds shorter than the input)\n"
-                    )
-            if validation_output.latency.manual is None:
-                if validation_output.latency.calibration.warnings.matches_lookahead:
-                    msg += (
-                        "\t\t* The calibrated latency is the maximum allowed. This is "
-                        "probably because the latency calibration was triggered by noise.\n"
-                    )
-                if validation_output.latency.calibration.warnings.disagreement_too_high:
-                    msg += "\t\t* The calculated latencies are too different from each other.\n"
-            if not validation_output.checks.passed:
-                msg += "\t\t* A data check failed (TODO in more detail).\n"
-            if not validation_output.pytorch.passed:
-                msg += "\t\t* PyTorch data set errors:\n"
-                for split in _Split:
-                    split_validation = getattr(validation_output.pytorch, split.value)
-                    if not split_validation.passed:
-                        msg += f"   * {split.value:10s}: {split_validation.msg}\n"
-            return msg
-
-        # Validate input
-        input_validation = _core.validate_input(input_path)
-        if not input_validation.passed:
-            self._wait_while_func(
-                (lambda resume, *args, **kwargs: _OkModal(resume, *args, **kwargs)),
-                f"Input file {input_path} is not recognized as a standardized input "
-                "file.\nTraining cannot proceed.",
-            )
-            return False
-
-        user_latency = self.advanced_options.latency
-        file_validation_outputs = {
-            output_path: _core.validate_data(
-                input_path,
-                output_path,
-                user_latency,
-            )
-            for output_path in output_paths
-        }
-        if any(not fv.passed for fv in file_validation_outputs.values()):
-            msg = "The following output files failed checks:\n" + "".join(
-                [
-                    make_message_for_file(output_path, fv)
-                    for output_path, fv in file_validation_outputs.items()
-                    if not fv.passed
-                ]
-            )
-            if all(fv.passed_critical for fv in file_validation_outputs.values()):
-                msg += "\nIgnore and proceed?"
-
-                # Hacky to listen to the modal:
-                modal_listener = {"proceed": False, "still_open": True}
-
-                def on_yes():
-                    modal_listener["proceed"] = True
-
-                def on_no():
-                    modal_listener["proceed"] = False
-
-                def on_close():
-                    if modal_listener["proceed"]:
-                        self._train2(ignore_checks=True)
-
-                self._wait_while_func(
-                    (
-                        lambda resume, on_yes, on_no, *args, **kwargs: _YesNoModal(
-                            on_yes, on_no, resume, *args, **kwargs
-                        )
-                    ),
-                    on_yes=on_yes,
-                    on_no=on_no,
-                    msg=msg,
-                    on_close=on_close,
-                    label_kwargs={"justify": "left"},
-                )
-                return False  # we still failed checks so say so.
+                    self.metrics_label.configure(text="Training initializing...")
             else:
-                msg += "\nCritical errors found, cannot ignore."
-                self._wait_while_func(
-                    lambda resume, msg, **kwargs: _OkModal(resume, msg, **kwargs),
-                    msg=msg,
-                    label_kwargs={"justify": "left"},
+                self.progress_bar.stop()
+                self.progress_bar.configure(mode="determinate")
+                self.progress_bar.set(0.0)
+                self.metrics_label.configure(text="Queued in line...")
+        elif status == TaskStatus.COMPLETED:
+            self.cancel_button.configure(state="disabled")
+            self.open_dir_button.configure(state="normal")
+            self.close_tab_button.configure(state="normal")
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self.progress_bar.set(1.0)
+            if self.task.esr > 0:
+                self.metrics_label.configure(
+                    text=f"Completed!  |  Final ESR: {self.task.esr:.6f}  |  Speed: {self.task.it_per_sec:.2f} it/s ({self.task.epoch_dur:.2f}s/ep)"
                 )
-                return False
+            else:
+                self.metrics_label.configure(text="Completed successfully!")
+        elif status in (TaskStatus.FAILED, TaskStatus.CANCELED):
+            self.cancel_button.configure(state="disabled")
+            self.open_dir_button.configure(state="disabled")
+            self.close_tab_button.configure(state="normal")
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self.progress_bar.set(0.0)
+            if status == TaskStatus.FAILED:
+                self.metrics_label.configure(text="Training Failed", text_color="#EF5350")
+            else:
+                self.metrics_label.configure(text="Training Canceled", text_color="#FFB74D")
 
-        return True
+    def poll_logs(self):
+        has_new = False
+        while not self.task.log_queue.empty():
+            try:
+                line = self.task.log_queue.get_nowait()
+                self.log_textbox.insert("end", line)
+                has_new = True
+            except Exception:
+                break
+        if has_new:
+            self.log_textbox.see("end")
 
-    def _wait_while_func(self, func, *args, **kwargs):
-        """
-        Disable this GUI while something happens.
-        That function _needs_ to call the provided self._resume when it's ready to
-        release me!
-        """
-        self._disable()
-        func(self._resume, *args, **kwargs)
+    def _cancel_job(self):
+        self.task_manager.cancel_task(self.task.task_id)
 
+    def _open_export_dir(self):
+        path = str(self.task.train_destination.resolve())
+        if sys.platform == "darwin":
+            os.system(f'open "{path}"')
+        elif os.name == "nt":
+            os.startfile(path)
+        else:
+            os.system(f'xdg-open "{path}"')
 
-# some typing functions
-def _non_negative_int(val):
-    val = int(val)
-    if val < 0:
-        val = 0
-    return val
-
-
-class _TypeOrNull(object):
-    def __init__(self, T, null_str=""):
-        """
-        :param T: tpe to cast to on .forward()
-        """
-        self._T = T
-        self._null_str = null_str
-
-    @property
-    def null_str(self) -> str:
-        """
-        What str is displayed when for "None"
-        """
-        return self._null_str
-
-    def forward(self, val: str):
-        val = val.rstrip()
-        return None if val == self._null_str else self._T(val)
-
-    def inverse(self, val) -> str:
-        return self._null_str if val is None else str(val)
+    def _close_tab(self):
+        if self.task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED):
+            self.on_close_tab_cb(self.tab_name)
 
 
-_int_or_null = _TypeOrNull(int)
-_float_or_null = _TypeOrNull(float)
-
-
-def _rstripped_str(val):
-    return str(val).rstrip()
-
-
-class _SettingWidget(_abc.ABC):
+class ModernNAMGUI(ctk.CTk):
     """
-    A widget for the user to interact with to set something
+    Main Application Window for Neural Amp Modeler.
     """
 
-    @_abc.abstractmethod
-    def get(self):
-        pass
+    def __init__(self):
+        super().__init__()
 
+        self.title("NAM Trainer")
+        self.minsize(920, 680)
+        self._center_window(1100, 800)
 
-class LabeledOptionMenu(_SettingWidget):
-    """
-    Label (left) and radio buttons (right)
-    """
+        self.task_manager = TaskManager(max_parallel=3)
+        self.job_tabs: Dict[str, JobTabUI] = {}
 
-    def __init__(
-        self,
-        frame: _tk.Frame,
-        label: str,
-        choices: _Enum,
-        default: _Optional[_Enum] = None,
-    ):
-        """
-        :param command: Called to propagate option selection. Is provided with the
-            value corresponding to the radio button selected.
-        """
-        self._frame = frame
-        self._choices = choices
-        height = _BUTTON_HEIGHT
-        bg = None
-        self._label = _tk.Label(
-            frame,
-            width=_ADVANCED_OPTIONS_LEFT_WIDTH,
-            height=height,
-            bg=bg,
+        # Paths
+        self.input_path: Optional[Path] = settings.get_last_path(settings.PathKey.INPUT_FILE)
+        self.output_paths: List[Path] = []
+        last_out = settings.get_last_path(settings.PathKey.OUTPUT_FILE)
+        if last_out and last_out.exists():
+            self.output_paths.append(last_out)
+
+        self.train_destination: Optional[Path] = settings.get_last_path(settings.PathKey.TRAINING_DESTINATION)
+
+        self._build_ui()
+        self._check_for_updates()
+
+        # Start periodic UI polling timer
+        self.after(100, self._periodic_poll)
+
+    def _center_window(self, width: int, height: int):
+        self.update_idletasks()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = max(0, int((screen_width / 2) - (width / 2)))
+        y = max(0, int((screen_height / 2) - (height / 2)))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _build_ui(self):
+        # Header Banner
+        header = ctk.CTkFrame(self, corner_radius=0, fg_color="#1E1E1E", height=70)
+        header.pack(fill="x", side="top")
+
+        title_frame = ctk.CTkFrame(header, fg_color="transparent")
+        title_frame.pack(side="left", padx=20, pady=10)
+
+        title_lbl = ctk.CTkLabel(
+            title_frame,
+            text="NAM TRAINER",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color="#4FC3F7",
+        )
+        title_lbl.pack(anchor="w")
+
+        sub_lbl = ctk.CTkLabel(
+            title_frame,
+            text=f"Version {__version__}  |  Deep Learning Amp & Pedal Modeling",
+            font=ctk.CTkFont(size=11),
+            text_color="gray60",
+        )
+        sub_lbl.pack(anchor="w")
+
+        self.update_badge = ctk.CTkLabel(
+            header,
+            text="Checking for updates...",
+            font=ctk.CTkFont(size=11),
+            text_color="gray60",
+        )
+        self.update_badge.pack(side="right", padx=20)
+
+        # Tabview
+        self.tabview = ctk.CTkTabview(self, corner_radius=10)
+        self.tabview.pack(fill="both", expand=True, padx=15, pady=15)
+
+        # Setup Tab
+        self.tab_setup = self.tabview.add("Setup & Queue")
+        self._build_setup_tab()
+
+    def _build_setup_tab(self):
+        # Scrollable container for setup tab
+        setup_container = ctk.CTkScrollableFrame(self.tab_setup, fg_color="transparent")
+        setup_container.pack(fill="both", expand=True)
+
+        # 2-column layout
+        left_col = ctk.CTkFrame(setup_container, fg_color="transparent")
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=5)
+
+        right_col = ctk.CTkFrame(setup_container, fg_color="transparent")
+        right_col.pack(side="right", fill="both", expand=True, padx=(8, 0), pady=5)
+
+        # LEFT COLUMN - File Selection & Training Parameters
+        # 1. File Selection Card
+        file_card = ctk.CTkFrame(left_col, corner_radius=10)
+        file_card.pack(fill="x", pady=(0, 10))
+
+        file_card_lbl = ctk.CTkLabel(
+            file_card, text="1. Audio File Configuration", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        file_card_lbl.pack(anchor="w", padx=15, pady=(12, 8))
+
+        # Input Path Selector
+        in_btn_frame = ctk.CTkFrame(file_card, fg_color="transparent")
+        in_btn_frame.pack(fill="x", padx=15, pady=4)
+
+        self.in_btn = ctk.CTkButton(
+            in_btn_frame, text="Select Input WAV...", width=160, command=self._browse_input_path
+        )
+        self.in_btn.pack(side="left")
+
+        self.in_lbl = ctk.CTkLabel(
+            in_btn_frame,
+            text=str(self.input_path) if self.input_path else "No file selected",
+            text_color="white" if self.input_path else "#E57373",
             anchor="w",
-            text=label,
         )
-        self._label.pack(side=_tk.LEFT)
+        self.in_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
-        frame_menu = _tk.Frame(frame)
-        frame_menu.pack(side=_tk.RIGHT)
+        # Output Path Selector
+        out_btn_frame = ctk.CTkFrame(file_card, fg_color="transparent")
+        out_btn_frame.pack(fill="x", padx=15, pady=4)
 
-        self._selected_value = None
-        default = (list(choices)[0] if default is None else default).value
-        self._menu = _tk.OptionMenu(
-            frame_menu,
-            _tk.StringVar(master=frame, value=default, name=label),
-            # default,
-            *[choice.value for choice in choices],  #  if choice.value!=default],
-            command=self._set,
+        self.out_btn = ctk.CTkButton(
+            out_btn_frame, text="Select Output WAV(s)...", width=160, command=self._browse_output_paths
         )
-        self._menu.config(width=_ADVANCED_OPTIONS_RIGHT_WIDTH)
-        self._menu.pack(side=_tk.RIGHT)
-        # Initialize
-        self._set(default)
+        self.out_btn.pack(side="left")
 
-    def get(self) -> _Enum:
-        return self._selected_value
-
-    def _set(self, val: str):
-        """
-        Set the value selected
-        """
-        self._selected_value = self._choices(val)
-
-
-class _Hovertip(Hovertip):
-    """
-    Adjustments:
-
-    * Always black text (macOS)
-    """
-
-    def showcontents(self):
-        # Override
-        label = _tk.Label(
-            self.tipwindow,
-            text=self.text,
-            justify=_tk.LEFT,
-            background="#ffffe0",
-            relief=_tk.SOLID,
-            borderwidth=1,
-            fg="black",
+        self.out_lbl = ctk.CTkLabel(
+            out_btn_frame,
+            text=self._format_output_label_text(),
+            text_color="white" if self.output_paths else "#E57373",
+            anchor="w",
         )
-        label.pack()
+        self.out_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
+        # Destination Directory Selector
+        dest_btn_frame = ctk.CTkFrame(file_card, fg_color="transparent")
+        dest_btn_frame.pack(fill="x", padx=15, pady=(4, 15))
 
-class LabeledText(_SettingWidget):
-    """
-    Label (left) and text input (right)
-    """
-
-    def __init__(
-        self,
-        frame: _tk.Frame,
-        label: str,
-        default=None,
-        type=None,
-        left_width=_ADVANCED_OPTIONS_LEFT_WIDTH,
-        right_width=_ADVANCED_OPTIONS_RIGHT_WIDTH,
-    ):
-        """
-        :param command: Called to propagate option selection. Is provided with the
-            value corresponding to the radio button selected.
-        :param type: If provided, casts value to given type
-        :param left_width: How much space to use on the left side (text)
-        :param right_width: How much space for the Text field
-        """
-        self._frame = frame
-        label_height = 2
-        text_height = 1
-        self._label = _tk.Label(
-            frame,
-            width=left_width,
-            height=label_height,
-            bg=None,
-            anchor="e",
-            text=label,
+        self.dest_btn = ctk.CTkButton(
+            dest_btn_frame, text="Select Export Folder...", width=160, command=self._browse_destination
         )
-        self._label.pack(side=_tk.LEFT)
+        self.dest_btn.pack(side="left")
 
-        self._text = _tk.Text(
-            frame,
-            width=right_width,
-            height=text_height,
-            bg=None,
+        self.dest_lbl = ctk.CTkLabel(
+            dest_btn_frame,
+            text=str(self.train_destination) if self.train_destination else "No folder selected",
+            text_color="white" if self.train_destination else "#E57373",
+            anchor="w",
         )
-        self._text.pack(side=_tk.RIGHT)
+        self.dest_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
-        self._type = (lambda x: x) if type is None else type
+        # 2. Options Card
+        opts_card = ctk.CTkFrame(left_col, corner_radius=10)
+        opts_card.pack(fill="x", pady=5)
 
-        if default is not None:
-            self._text.insert("1.0", str(default))
-
-        # You can assign a tooltip for the label if you'd like.
-        self.label_tooltip: _Optional[_Hovertip] = None
-
-    @property
-    def label(self) -> _tk.Label:
-        return self._label
-
-    def get(self):
-        """
-        Attempt to get and return the value.
-        May throw a tk.TclError indicating something went wrong getting the value.
-        """
-        # "1.0" means Line 1, character zero (wat)
-        return self._type(self._text.get("1.0", _tk.END))
-
-
-class AdvancedOptionsGUI(object):
-    """
-    A window to hold advanced options.
-    """
-
-    def __init__(self, resume_main, parent: GUI):
-        self._parent = parent
-        self._root = _TopLevelWithOk(self.apply, resume_main)
-        self._root.title("Advanced Options")
-
-        self.pack()
-
-        # "Ok": apply and destroy
-        self._frame_ok = _tk.Frame(self._root)
-        self._frame_ok.pack()
-        self._button_ok = _tk.Button(
-            self._frame_ok,
-            text="Ok",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=lambda: self._root.destroy(pressed_ok=True),
+        opts_card_lbl = ctk.CTkLabel(
+            opts_card, text="2. Training Parameters", font=ctk.CTkFont(size=14, weight="bold")
         )
-        self._button_ok.pack()
+        opts_card_lbl.pack(anchor="w", padx=15, pady=(12, 8))
 
-    def apply(self):
-        """
-        Set values to parent and destroy this object
-        """
+        # Epochs & Latency
+        ep_frame = ctk.CTkFrame(opts_card, fg_color="transparent")
+        ep_frame.pack(fill="x", padx=15, pady=4)
 
-        def safe_apply(name):
+        ctk.CTkLabel(ep_frame, text="Epochs:", width=80, anchor="w").pack(side="left")
+        self.epochs_entry = ctk.CTkEntry(ep_frame, width=80)
+        self.epochs_entry.insert(0, str(_DEFAULT_NUM_EPOCHS))
+        self.epochs_entry.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(ep_frame, text="Latency (samples):", width=120, anchor="w").pack(side="left")
+        self.latency_entry = ctk.CTkEntry(ep_frame, width=80, placeholder_text="Auto")
+        self.latency_entry.pack(side="left")
+
+        # Checkboxes
+        chk_frame = ctk.CTkFrame(opts_card, fg_color="transparent")
+        chk_frame.pack(fill="x", padx=15, pady=(8, 15))
+
+        self.var_ignore_checks = ctk.BooleanVar(value=False)
+        self.chk_ignore = ctk.CTkCheckBox(
+            chk_frame, text="Ignore Data Checks", variable=self.var_ignore_checks
+        )
+        self.chk_ignore.pack(side="left", padx=(0, 15))
+
+        self.var_save_plot = ctk.BooleanVar(value=True)
+        self.chk_plot = ctk.CTkCheckBox(
+            chk_frame, text="Save Plot", variable=self.var_save_plot
+        )
+        self.chk_plot.pack(side="left", padx=(0, 15))
+
+        self.var_silent = ctk.BooleanVar(value=False)
+        self.chk_silent = ctk.CTkCheckBox(
+            chk_frame, text="Silent Training", variable=self.var_silent
+        )
+        self.chk_silent.pack(side="left")
+
+        # RIGHT COLUMN - User Metadata & Queue Overview
+        # 1. Metadata Card
+        meta_card = ctk.CTkFrame(right_col, corner_radius=10)
+        meta_card.pack(fill="x", pady=(0, 10))
+
+        meta_card_lbl = ctk.CTkLabel(
+            meta_card, text="3. Model Metadata", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        meta_card_lbl.pack(anchor="w", padx=15, pady=(12, 8))
+
+        # Gear & Tone Type
+        gt_frame = ctk.CTkFrame(meta_card, fg_color="transparent")
+        gt_frame.pack(fill="x", padx=15, pady=4)
+
+        ctk.CTkLabel(gt_frame, text="Gear Type:", width=80, anchor="w").pack(side="left")
+        self.gear_dropdown = ctk.CTkOptionMenu(
+            gt_frame, values=[g.value for g in GearType], width=140
+        )
+        self.gear_dropdown.set(GearType.AMP.value)
+        self.gear_dropdown.pack(side="left", padx=(0, 15))
+
+        ctk.CTkLabel(gt_frame, text="Tone Type:", width=80, anchor="w").pack(side="left")
+        self.tone_dropdown = ctk.CTkOptionMenu(
+            gt_frame, values=[t.value for t in ToneType], width=140
+        )
+        self.tone_dropdown.set(ToneType.OVERDRIVE.value)
+        self.tone_dropdown.pack(side="left")
+
+        # User Name & Description
+        user_frame = ctk.CTkFrame(meta_card, fg_color="transparent")
+        user_frame.pack(fill="x", padx=15, pady=(4, 15))
+
+        ctk.CTkLabel(user_frame, text="Author Name:", width=80, anchor="w").pack(side="left")
+        self.author_entry = ctk.CTkEntry(user_frame, width=140, placeholder_text="Optional")
+        self.author_entry.pack(side="left", padx=(0, 15))
+
+        ctk.CTkLabel(user_frame, text="Model Name:", width=80, anchor="w").pack(side="left")
+        self.model_name_entry = ctk.CTkEntry(user_frame, width=140, placeholder_text="Auto from file")
+        self.model_name_entry.pack(side="left")
+
+        # 2. Queue Overview Card
+        queue_card = ctk.CTkFrame(right_col, corner_radius=10)
+        queue_card.pack(fill="both", expand=True, pady=5)
+
+        queue_card_lbl = ctk.CTkLabel(
+            queue_card, text="4. Task Queue Overview (Max 3 Parallel)", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        queue_card_lbl.pack(anchor="w", padx=15, pady=(12, 8))
+
+        self.queue_info_label = ctk.CTkLabel(
+            queue_card, text="No tasks submitted yet.", text_color="gray70", anchor="w"
+        )
+        self.queue_info_label.pack(anchor="w", padx=15, pady=(0, 8))
+
+        self.queue_list_frame = ctk.CTkScrollableFrame(queue_card, fg_color="transparent", height=140)
+        self.queue_list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Bottom Action Card - Start Training
+        action_card = ctk.CTkFrame(left_col, corner_radius=10, fg_color="transparent")
+        action_card.pack(fill="x", pady=10)
+
+        self.start_btn = ctk.CTkButton(
+            action_card,
+            text="Add Training Task(s) to Queue",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#0288D1",
+            hover_color="#0277BD",
+            height=45,
+            command=self._on_start_training,
+        )
+        self.start_btn.pack(fill="x")
+
+    def _format_output_label_text(self) -> str:
+        if not self.output_paths:
+            return "No output file(s) selected"
+        elif len(self.output_paths) == 1:
+            return str(self.output_paths[0])
+        else:
+            return f"{len(self.output_paths)} files selected (Batch Re-amp Mode)"
+
+    def _browse_input_path(self):
+        initial_dir = self.input_path.parent if self.input_path else Path.home()
+        filename = tk.filedialog.askopenfilename(
+            title="Select Input Audio File",
+            initialdir=initial_dir,
+            filetypes=[("WAV files", "*.wav"), ("Audio files", "*.wav *.flac *.mp3")],
+        )
+        if filename:
+            p = Path(filename)
+            self.input_path = p
+            settings.set_last_path(settings.PathKey.INPUT_FILE, p)
+            self.in_lbl.configure(text=str(p), text_color="white")
+
+    def _browse_output_paths(self):
+        initial_dir = self.output_paths[0].parent if self.output_paths else Path.home()
+        filenames = tk.filedialog.askopenfilenames(
+            title="Select Output Audio File(s)",
+            initialdir=initial_dir,
+            filetypes=[("WAV files", "*.wav"), ("Audio files", "*.wav *.flac *.mp3")],
+        )
+        if filenames:
+            paths = [Path(f) for f in filenames]
+            self.output_paths = paths
+            settings.set_last_path(settings.PathKey.OUTPUT_FILE, paths[0])
+            self.out_lbl.configure(text=self._format_output_label_text(), text_color="white")
+
+    def _browse_destination(self):
+        initial_dir = self.train_destination if self.train_destination else Path.home()
+        foldername = tk.filedialog.askdirectory(
+            title="Select Training Destination Directory", initialdir=initial_dir
+        )
+        if foldername:
+            p = Path(foldername)
+            self.train_destination = p
+            settings.set_last_path(settings.PathKey.TRAINING_DESTINATION, p)
+            self.dest_lbl.configure(text=str(p), text_color="white")
+
+    def _on_start_training(self):
+        # Validation checks
+        if not self.input_path or not self.input_path.exists():
+            tk.messagebox.showerror("Error", "Please select a valid input WAV audio file.")
+            return
+
+        if not self.output_paths:
+            tk.messagebox.showerror("Error", "Please select at least one output WAV audio file.")
+            return
+
+        if not self.train_destination or not self.train_destination.exists():
+            tk.messagebox.showerror(
+                "Error", "Please select a valid destination folder for exporting trained models."
+            )
+            return
+
+        try:
+            epochs = int(self.epochs_entry.get().strip())
+        except ValueError:
+            tk.messagebox.showerror("Error", "Epochs must be a valid integer.")
+            return
+
+        latency_text = self.latency_entry.get().strip()
+        latency = int(latency_text) if latency_text else None
+
+        # Build User Metadata
+        user_meta = UserMetadata(
+            name=self.author_entry.get().strip(),
+            model_name=self.model_name_entry.get().strip(),
+            gear_type=GearType(self.gear_dropdown.get()),
+            tone_type=ToneType(self.tone_dropdown.get()),
+        )
+
+        # Create tasks for each output file
+        first_created_tab = None
+        for out_path in self.output_paths:
+            custom_model_name = self.model_name_entry.get().strip()
+            task_name = custom_model_name if custom_model_name else re.sub(r"\.wav$", "", out_path.name)
+
+            task = self.task_manager.add_task(
+                name=task_name,
+                input_path=self.input_path,
+                output_path=out_path,
+                train_destination=self.train_destination,
+                epochs=epochs,
+                latency=latency,
+                silent=self.var_silent.get(),
+                save_plot=self.var_save_plot.get(),
+                ignore_checks=self.var_ignore_checks.get(),
+                user_metadata=user_meta,
+            )
+
+            # Create Tab UI for this task
+            job_tab = JobTabUI(
+                tabview=self.tabview,
+                task=task,
+                task_manager=self.task_manager,
+                on_close_tab_cb=self._on_close_job_tab,
+            )
+            self.job_tabs[job_tab.tab_name] = job_tab
+            if first_created_tab is None:
+                first_created_tab = job_tab.tab_name
+
+        self._refresh_queue_overview()
+
+        # Switch view to the newly created task tab
+        if first_created_tab:
+            self.tabview.set(first_created_tab)
+
+    def _on_close_job_tab(self, tab_name: str):
+        if tab_name in self.job_tabs:
+            del self.job_tabs[tab_name]
             try:
-                setattr(
-                    self._parent.advanced_options, name, getattr(self, "_" + name).get()
-                )
-            except ValueError:
+                self.tabview.delete(tab_name)
+            except Exception:
                 pass
 
-        for name in ("num_epochs", "latency", "threshold_esr"):
-            safe_apply(name)
+    def _refresh_queue_overview(self):
+        active = self.task_manager.get_active_count()
+        queued = self.task_manager.get_queued_count()
+        total = len(self.task_manager.tasks)
 
-    def pack(self):
-        # TODO things that are `_SettingWidget`s are named carefully, need to make this
-        # easier to work with.
-
-        # Number of epochs: text box
-        self._frame_epochs = _tk.Frame(self._root)
-        self._frame_epochs.pack()
-
-        self._num_epochs = LabeledText(
-            self._frame_epochs,
-            "Epochs",
-            default=str(self._parent.advanced_options.num_epochs),
-            type=_non_negative_int,
+        self.queue_info_label.configure(
+            text=f"Total Tasks: {total}  |  Active Running: {active}/3  |  Queued: {queued}"
         )
 
-        # Delay: text box
-        self._frame_latency = _tk.Frame(self._root)
-        self._frame_latency.pack()
+        # Clear existing items in list frame
+        for child in self.queue_list_frame.winfo_children():
+            child.destroy()
 
-        self._latency = LabeledText(
-            self._frame_latency,
-            "Reamp latency",
-            default=_int_or_null.inverse(self._parent.advanced_options.latency),
-            type=_int_or_null.forward,
-        )
+        for task in self.task_manager.tasks:
+            row = ctk.CTkFrame(self.queue_list_frame, fg_color="#2B2B2B", corner_radius=6)
+            row.pack(fill="x", pady=2, padx=2)
 
-        # Threshold ESR
-        self._frame_threshold_esr = _tk.Frame(self._root)
-        self._frame_threshold_esr.pack()
-        self._threshold_esr = LabeledText(
-            self._frame_threshold_esr,
-            "Threshold ESR",
-            default=_float_or_null.inverse(self._parent.advanced_options.threshold_esr),
-            type=_float_or_null.forward,
-        )
+            name_lbl = ctk.CTkLabel(
+                row,
+                text=f"#{task.task_id}: {task.name}",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                anchor="w",
+            )
+            name_lbl.pack(side="left", padx=10, pady=5)
 
+            status_lbl = ctk.CTkLabel(
+                row,
+                text=task.status.value.upper(),
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=JobTabUI._get_status_color(None, task.status),
+            )
+            status_lbl.pack(side="right", padx=10, pady=5)
 
-class UserMetadataGUI(object):
-    # Things that are auto-filled:
-    # Model date
-    # gain
-    def __init__(self, resume_main, parent: GUI):
-        self._parent = parent
-        self._root = _TopLevelWithOk(self.apply, resume_main)
-        self._root.title("Metadata")
+    def _periodic_poll(self):
+        # Poll logs and status updates for all active job tabs
+        for job_tab in list(self.job_tabs.values()):
+            job_tab.poll_logs()
+            job_tab.update_status()
 
-        # Pack all the widgets
-        self.pack()
+        self._refresh_queue_overview()
+        self.after(100, self._periodic_poll)
 
-        # "Ok": apply and destroy
-        self._frame_ok = _tk.Frame(self._root)
-        self._frame_ok.pack()
-        self._button_ok = _tk.Button(
-            self._frame_ok,
-            text="Ok",
-            width=_BUTTON_WIDTH,
-            height=_BUTTON_HEIGHT,
-            command=lambda: self._root.destroy(pressed_ok=True),
-        )
-        self._button_ok.pack()
+    def _check_for_updates(self):
+        def _check():
+            latest = _get_latest_version_from_github()
+            if latest:
+                try:
+                    curr = get_current_version()
+                    if latest > curr:
+                        self.update_badge.configure(
+                            text=f"Update Available: v{latest}!", text_color="#FFB74D"
+                        )
+                    else:
+                        self.update_badge.configure(text=f"Up to date (v{curr})", text_color="gray60")
+                except Exception:
+                    self.update_badge.configure(text=f"Latest release: v{latest}", text_color="gray60")
+            else:
+                self.update_badge.configure(text=f"Version {__version__}", text_color="gray60")
 
-    def apply(self):
-        """
-        Set values to parent and destroy this object
-        """
+        import threading
 
-        def safe_apply(name):
-            try:
-                setattr(
-                    self._parent.user_metadata, name, getattr(self, "_" + name).get()
-                )
-            except ValueError:
-                pass
-
-        # TODO could clean up more / see `.pack()`
-        for name in (
-            "name",
-            "modeled_by",
-            "gear_make",
-            "gear_model",
-            "gear_type",
-            "tone_type",
-            "input_level_dbu",
-            "output_level_dbu",
-        ):
-            safe_apply(name)
-        self._parent.user_metadata_flag = True
-
-    def pack(self):
-        # TODO things that are `_SettingWidget`s are named carefully, need to make this
-        # easier to work with.
-
-        LabeledText_ = _partial(
-            LabeledText,
-            left_width=_METADATA_LEFT_WIDTH,
-            right_width=_METADATA_RIGHT_WIDTH,
-        )
-        parent = self._parent
-
-        # Name
-        self._frame_name = _tk.Frame(self._root)
-        self._frame_name.pack()
-        self._name = LabeledText_(
-            self._frame_name,
-            "NAM name",
-            default=parent.user_metadata.name,
-            type=_rstripped_str,
-        )
-        # Modeled by
-        self._frame_modeled_by = _tk.Frame(self._root)
-        self._frame_modeled_by.pack()
-        self._modeled_by = LabeledText_(
-            self._frame_modeled_by,
-            "Modeled by",
-            default=parent.user_metadata.modeled_by,
-            type=_rstripped_str,
-        )
-        # Gear make
-        self._frame_gear_make = _tk.Frame(self._root)
-        self._frame_gear_make.pack()
-        self._gear_make = LabeledText_(
-            self._frame_gear_make,
-            "Gear make",
-            default=parent.user_metadata.gear_make,
-            type=_rstripped_str,
-        )
-        # Gear model
-        self._frame_gear_model = _tk.Frame(self._root)
-        self._frame_gear_model.pack()
-        self._gear_model = LabeledText_(
-            self._frame_gear_model,
-            "Gear model",
-            default=parent.user_metadata.gear_model,
-            type=_rstripped_str,
-        )
-        # Calibration: input & output dBu
-        self._frame_input_dbu = _tk.Frame(self._root)
-        self._frame_input_dbu.pack()
-        self._input_level_dbu = LabeledText_(
-            self._frame_input_dbu,
-            "Reamp send level (dBu)",
-            default=_float_or_null.inverse(parent.user_metadata.input_level_dbu),
-            type=_float_or_null.forward,
-        )
-        self._input_level_dbu.label_tooltip = _Hovertip(
-            anchor_widget=self._input_level_dbu.label,
-            text=(
-                "(Ok to leave blank)\n\n"
-                "Play a sine wave with frequency 1kHz and peak amplitude 0dBFS. Use\n"
-                "a multimeter to measure the RMS voltage of the signal at the jack\n"
-                "that connects to your gear, and convert to dBu.\n"
-                "Record the value here."
-            ),
-        )
-        self._frame_output_dbu = _tk.Frame(self._root)
-        self._frame_output_dbu.pack()
-        self._output_level_dbu = LabeledText_(
-            self._frame_output_dbu,
-            "Reamp return level (dBu)",
-            default=_float_or_null.inverse(parent.user_metadata.output_level_dbu),
-            type=_float_or_null.forward,
-        )
-        self._output_level_dbu.label_tooltip = _Hovertip(
-            anchor_widget=self._output_level_dbu.label,
-            text=(
-                "(Ok to leave blank)\n\n"
-                "Play a sine wave with frequency 1kHz into your interface where\n"
-                "you're recording your gear. Keeping the interface's input gain\n"
-                "trimmed as you will use it when recording, adjust the sine wave\n"
-                "until the input peaks at exactly 0dBFS in your DAW. Measure the RMS\n"
-                "voltage and convert to dBu.\n"
-                "Record the value here."
-            ),
-        )
-        # Gear type
-        self._frame_gear_type = _tk.Frame(self._root)
-        self._frame_gear_type.pack()
-        self._gear_type = LabeledOptionMenu(
-            self._frame_gear_type,
-            "Gear type",
-            _GearType,
-            default=parent.user_metadata.gear_type,
-        )
-        # Tone type
-        self._frame_tone_type = _tk.Frame(self._root)
-        self._frame_tone_type.pack()
-        self._tone_type = LabeledOptionMenu(
-            self._frame_tone_type,
-            "Tone type",
-            _ToneType,
-            default=parent.user_metadata.tone_type,
-        )
-
-
-def _install_error():
-    window = _tk.Tk()
-    window.title("ERROR")
-    label = _tk.Label(
-        window,
-        width=45,
-        height=2,
-        text="The NAM training software has not been installed correctly.",
-    )
-    label.pack()
-    button = _tk.Button(window, width=10, height=2, text="Quit", command=window.destroy)
-    button.pack()
-    window.mainloop()
+        threading.Thread(target=_check, daemon=True).start()
 
 
 def run():
-    if _install_is_valid:
-        _gui = GUI()
-        _gui.mainloop()
-        print("Shut down NAM trainer")
-    else:
-        _install_error()
+    if not _HAVE_CUSTOMTKINTER:
+        root = tk.Tk()
+        root.title("Error")
+        tk.Label(
+            root, text="customtkinter is required to run the NAM GUI.\nPlease run: pip install customtkinter"
+        ).pack(padx=20, pady=20)
+        root.mainloop()
+        return
 
+    if _INSTALL_IS_VALID:
+        app = ModernNAMGUI()
+        app.mainloop()
+        print("Shut down NAM trainer GUI.")
+    else:
+        root = tk.Tk()
+        root.title("Install Error")
+        tk.Label(
+            root, text="The NAM training software has not been installed correctly."
+        ).pack(padx=20, pady=20)
+        root.mainloop()
+
+
+GUI = ModernNAMGUI
 
 if __name__ == "__main__":
     run()
